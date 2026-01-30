@@ -77,12 +77,13 @@ class gibMacOS:
             "monterey" : "12",
             "ventura" : "13",
             "sonoma" : "14",
-            "sequoia" : "15"
+            "sequoia" : "15",
+            "tahoe" : "26"
         }
         self.current_catalog = self.settings.get("current_catalog","publicrelease")
         self.catalog_data    = None
         self.scripts = "Scripts"
-        self.plist   = "sucatalog.plist"
+        self.local_catalog = os.path.join(os.path.dirname(os.path.realpath(__file__)),self.scripts,"sucatalog.plist")
         self.caffeinate_downloads = self.settings.get("caffeinate_downloads",True)
         self.caffeinate_process = None
         self.save_local = False
@@ -134,8 +135,14 @@ class gibMacOS:
         if not self.get_catalog_data(self.save_local):
             message = "The currently selected catalog ({}) was not reachable\n".format(self.current_catalog)
             if self.save_local:
-                message += "and I was unable to locate a valid {} file in the\n{} directory.\n".format(self.plist, self.scripts)
+                message += "and I was unable to locate a valid catalog file at:\n - {}\n".format(
+                    self.local_catalog
+                )
             message += "Please ensure you have a working internet connection."
+            if self.interactive:
+                print(message)
+                self.u.grab("\nPress [enter] to continue...")
+                return
             raise ProgramError(message, title="Catalog Data Error")
         self.u.head("Parsing Data")
         self.u.info("Scanning products after catalog download...\n")
@@ -163,7 +170,9 @@ class gibMacOS:
         if minos is None: minos = self.min_macos
         if maxos is None: maxos = self.current_macos
         if minos > maxos: minos,maxos = maxos,minos # Ensure min is less than or equal
-        os_versions = [self.num_to_macos(x,for_url=True) for x in range(minos,maxos+1)]
+        os_versions = [self.num_to_macos(x,for_url=True) for x in range(minos,min(maxos+1,21))] # until sequoia
+        if maxos > 30: # since tahoe
+            os_versions.extend([self.num_to_macos(x,for_url=True) for x in range(31,maxos+1)])
         if catalog:
             # We have a custom catalog - prepend the first entry + catalog to the list
             custom_cat_entry = os_versions[-1]+catalog
@@ -183,19 +192,19 @@ class gibMacOS:
         url = self.build_url(catalog=self.current_catalog, version=self.current_macos)
         self.u.head("Downloading Catalog")
         if local:
-            self.u.info("Checking locally for {}".format(self.plist))
-            cwd = os.getcwd()
-            os.chdir(os.path.dirname(os.path.realpath(__file__)))
-            if os.path.exists(os.path.join(os.path.dirname(os.path.realpath(__file__)), self.scripts, self.plist)):
+            self.u.info("Checking for:\n - {}".format(
+                self.local_catalog
+            ))
+            if os.path.exists(self.local_catalog):
                 self.u.info(" - Found - loading...")
                 try:
-                    with open(os.path.join(os.getcwd(), self.scripts, self.plist), "rb") as f:
+                    with open(self.local_catalog, "rb") as f:
                         self.catalog_data = plist.load(f)
-                    os.chdir(cwd)
+                        assert isinstance(self.catalog_data,dict)
                     return True
-                except:
-                    self.u.info(" - Error loading - downloading instead...\n")
-                    os.chdir(cwd)
+                except Exception as e:
+                    self.u.info(" - Error loading: {}".format(e))
+                    self.u.info(" - Downloading instead...\n")
             else:
                 self.u.info(" - Not found - downloading instead...\n")
         self.u.info("Currently downloading {} catalog from:\n\n{}\n".format(self.current_catalog, url))
@@ -209,14 +218,13 @@ class gibMacOS:
         try:
             # Assume it's valid data - dump it to a local file
             if local or self.force_local:
-                self.u.info(" - Saving to {}...".format(self.plist))
-                cwd = os.getcwd()
-                os.chdir(os.path.dirname(os.path.realpath(__file__)))
-                with open(os.path.join(os.getcwd(), self.scripts, self.plist), "wb") as f:
+                self.u.info(" - Saving to:\n - {}".format(
+                    self.local_catalog
+                ))
+                with open(self.local_catalog, "wb") as f:
                     plist.dump(self.catalog_data, f)
-                os.chdir(cwd)
-        except:
-            self.u.info(" - Error saving!")
+        except Exception as e:
+            self.u.info(" - Error saving: {}".format(e))
             return False
         return True
 
@@ -305,11 +313,22 @@ class gibMacOS:
                 " - FULL Install" if self.find_recovery and prod["installer"] else ""
             ))
 
+        def prod_valid(prod,prod_list,prod_keys):
+            # Check if the prod has all prod keys, and
+            # none are "Unknown"
+            if not isinstance(prod_list,dict) or not prod in prod_list or \
+            not all(x in prod_list[prod] for x in prod_keys):
+                # Wrong type, missing the prod, or prod_list keys
+                return False
+            # Let's make sure none of the keys return Unknown
+            if any(prod_list[prod].get(x,"Unknown")=="Unknown" for x in prod_keys):
+                return False
+            return True
+
         # Boolean to keep track of cache updates
         prod_changed = False
         for prod in prods:
-            if prod in self.prod_cache and isinstance(self.prod_cache[prod],dict) \
-            and all(x in self.prod_cache[prod] for x in prod_keys):
+            if prod_valid(prod,self.prod_cache,prod_keys):
                 # Already have it - and it's valid.
                 # Create a shallow copy
                 prodd = {}
@@ -360,12 +379,18 @@ class gibMacOS:
                 temp_prod = {}
                 for key in prodd:
                     if key in ("packages","size"): continue
+                    if prodd[key] == "Unknown":
+                        # Don't cache Unknown values
+                        temp_prod = None
+                        break
                     temp_prod[key] = prodd[key]
-                self.prod_cache[prod] = temp_prod
+                if temp_prod:
+                    # Only update the cache if it changed
+                    self.prod_cache[prod] = temp_prod
             # Log the product
             print_prod(prodd,prod_list)
         # Try saving the cache for later
-        if prod_changed:
+        if prod_changed and self.prod_cache:
             try: self.save_prod_cache()
             except: pass
         # Sort by newest
@@ -593,8 +618,13 @@ class gibMacOS:
         if not version: return
         self.current_macos = version
         self.save_settings()
-        # At this point, we should be good
-        self.get_catalog_data()
+        # At this point, we should be good - set teh catalog
+        # data - but if it fails, remove the listed prods
+        if not self.get_catalog_data():
+            self.catalog_data = None
+            self.u.grab("\nPress [enter] to return...")
+            self.pick_macos()
+            return
 
     def main(self, dmg = False):
         lines = []
@@ -643,7 +673,6 @@ class gibMacOS:
             self.u.custom_quit()
         elif menu[0].lower() == "u":
             self.show_catalog_url()
-            return
         elif menu[0].lower() == "m":
             self.pick_macos()
         elif menu[0].lower() == "c":
@@ -651,7 +680,6 @@ class gibMacOS:
         elif menu[0].lower() == "i":
             self.print_urls ^= True
             self.save_settings()
-            return
         elif menu[0].lower() == "h":
             self.hide_pid ^= True
             self.save_settings()
@@ -665,7 +693,6 @@ class gibMacOS:
             self.r.run({"args":["softwareupdate","--set-catalog",url],"sudo":True})
             print("")
             self.u.grab("Done",timeout=5)
-            return
         elif menu[0].lower() == "l" and sys.platform.lower() == "darwin":
             # Clear the software update catalog
             self.u.head("Clearing SU CatalogURL")
@@ -673,7 +700,6 @@ class gibMacOS:
             self.r.run({"args":["softwareupdate","--clear-catalog"],"sudo":True})
             print("")
             self.u.grab("Done.", timeout=5)
-            return
         elif menu[0].lower() == "f" and sys.platform.lower() == "darwin":
             # Toggle our caffeinate downloads value and save settings
             self.caffeinate_downloads ^= True
@@ -686,16 +712,15 @@ class gibMacOS:
             self.u.head("Parsing Data")
             print("Re-scanning products after url preference toggled...\n")
             self.mac_prods = self.get_dict_for_prods(self.get_installers())
-            return
-        
-        # Assume we picked something
-        try:
-            menu = int(menu)
-        except:
-            return
-        if menu < 1 or menu > len(self.mac_prods):
-            return
-        self.download_prod(self.mac_prods[menu-1], dmg)
+        else:
+            # Assume we picked something
+            try:
+                menu = int(menu)
+            except:
+                return
+            if menu < 1 or menu > len(self.mac_prods):
+                return
+            self.download_prod(self.mac_prods[menu-1], dmg)
 
     def get_latest(self, device_id = None, dmg = False):
         self.u.head("Downloading Latest")
@@ -761,7 +786,8 @@ if __name__ == '__main__':
     parser.add_argument("-r", "--recovery", help="looks for RecoveryHDUpdate.pkg and RecoveryHDMetaDmg.pkg in lieu of com.apple.mpkg.OSInstall (overrides --dmg)", action="store_true")
     parser.add_argument("-d", "--dmg", help="downloads only the .dmg files", action="store_true")
     parser.add_argument("-s", "--savelocal", help="uses a locally saved sucatalog.plist if exists", action="store_true")
-    parser.add_argument("-n", "--newlocal", help="downloads and saves locally, overwriting any prior local sucatalog.plist", action="store_true")
+    parser.add_argument("-g", "--local-catalog", help="the path to the sucatalog.plist to use (implies --savelocal)")
+    parser.add_argument("-n", "--newlocal", help="downloads and saves locally, overwriting any prior sucatalog.plist (will use the path from --local-catalog if provided)", action="store_true")
     parser.add_argument("-c", "--catalog", help="sets the CATALOG to use - publicrelease, public, customer, developer")
     parser.add_argument("-p", "--product", help="sets the product id to search for (overrides --version)")
     parser.add_argument("-v", "--version", help="sets the version of macOS to target - eg '-v 10.14' or '-v Yosemite'")
@@ -787,6 +813,10 @@ if __name__ == '__main__':
 
     if args.savelocal:
         g.save_local = True
+
+    if args.local_catalog:
+        g.save_local = True
+        g.local_catalog = args.local_catalog
 
     if args.newlocal:
         g.force_local = True
